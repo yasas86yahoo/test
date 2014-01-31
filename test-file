@@ -1,0 +1,629 @@
+<?php
+
+namespace App\Trusrc\SourceBundle\Controller;
+
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Bundle\FrameworkBundle\Controller\Controller;
+use App\Trusrc\SourceBundle\Entity\Repository;
+use App\Trusrc\SourceBundle\Form\RepositoryType;
+use GitElephant\Repository as GitRepository;
+use GitElephant\Command\Caller\CallerSSH2;
+use Symfony\Component\Form\FormError;
+use Symfony\Component\HttpFoundation\Response;
+use \Symfony\Component\HttpFoundation\BinaryFileResponse;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+
+/**
+ * Repository controller.
+ *
+ */
+class RepositoryController extends Controller {
+
+    /**
+     * Lists all Repository entities.
+     *
+     */
+    public function indexAction($projectId) {
+        $em = $this->getDoctrine()->getManager();
+
+        $project = $em->getRepository('ProjectBundle:Project')->find($projectId);
+
+        $privateVisibility = $em->getRepository('SourceBundle:RepositoryVisibility')->findBy(['visibility' => 'private']);
+        $privateRepositories = $em->getRepository('SourceBundle:Repository')->findBy(['project' => $project,
+            'visibility' => $privateVisibility]);
+
+        $publicVisibility = $em->getRepository('SourceBundle:RepositoryVisibility')->findBy(['visibility' => 'public']);
+        $publicRepositories = $em->getRepository('SourceBundle:Repository')->findBy(['project' => $project,
+            'visibility' => $publicVisibility]);
+
+        $projectUsers = $em->getRepository('ProjectBundle:ProjectUser')->findBy(['project' => $project]);
+
+
+
+        return $this->render('SourceBundle:Repository:index.html.twig', [
+
+                    'projectId' => $projectId,
+                    'privateReposCount' => count($privateRepositories),
+                    'publicReposCount' => count($publicRepositories),
+                    'membersCount' => count($projectUsers),
+        ]);
+    }
+
+    public function listItemsAction(Request $request, $projectId) {
+
+        $page = $request->query->get('page', 1);
+        $term = $request->query->get('term');
+
+        $em = $this->getDoctrine()->getManager();
+
+        $entities = $em->getRepository('SourceBundle:Repository')->getSearchResults($projectId, $term);
+
+        $paginator = $this->get('knp_paginator');
+        $pagination = $paginator->paginate(
+                $entities, $page, 5/* limit per page */
+        );
+        return $this->render('SourceBundle:Repository:list_items.html.twig', ['entities' => $entities,
+                    'pagination' => $pagination]);
+    }
+
+    /**
+     * Displays a form to create a new Repository entity.
+     *
+     */
+    public function newAction($projectId) {
+        $em = $this->getDoctrine()->getManager();
+
+        $entity = new Repository();
+        $visibility = $em->find('SourceBundle:RepositoryVisibility', 'private');
+        $entity->setVisibility($visibility);
+
+        $form = $this->createCreateForm($entity, $projectId);
+
+        return $this->render('SourceBundle:Repository:new.html.twig', array(
+                    'entity' => $entity,
+                    'form' => $form->createView(),
+                    'projectId' => $projectId
+        ));
+    }
+
+    /**
+     * Creates a new Repository entity.
+     *
+     */
+    public function createAction(Request $request, $projectId) {
+        $entity = new Repository();
+        $form = $this->createCreateForm($entity, $projectId);
+        $em = $this->getDoctrine()->getManager();
+
+        $project = $em->getRepository('ProjectBundle:Project')->find($projectId);
+
+        $form->handleRequest($request);
+
+        $title = $form->get('title')->getData();
+        $repositories = $em->getRepository('SourceBundle:Repository')->findBy(['project' => $project, 'title' => $title]);
+        if ($repositories) {
+            $error = new FormError('Repository title already exists. ');
+            $form->get('title')->addError($error);
+        }
+        $path = $form->get('path')->getData();
+        $repositories = $em->getRepository('SourceBundle:Repository')->findBy(['project' => $project, 'path' => $path]);
+        if ($repositories) {
+            $error = new FormError('Repository path already exists. ');
+            $form->get('path')->addError($error);
+        }
+
+        if ($form->isValid()) {
+
+            $entity->setProject($project);
+            $entity->setBranchesCount(0);
+            $em->persist($entity);
+            $em->flush();
+
+            $bareRepoPath = $this->container->getParameter('git_bare_repository_path') .
+                    $entity->getProject()->getPath() . '/' . $entity->getPath() . '.git';
+
+            $tempRepoPath = $this->container->getParameter('git_temp_repository_path') .
+                    $entity->getProject()->getPath() . '/' . $entity->getPath() . '/';
+
+            $oripRepoPath = $this->container->getParameter('git_ori_repository_path') .
+                    $entity->getProject()->getPath() . '/';
+
+            $httpRepoSymLinkPath = $this->container->getParameter('git_http_repository_path') .
+                    $entity->getProject()->getPath() . '/' . $entity->getPath() . '.git';
+
+
+            $this->executeCommandAsGitUser("mkdir $bareRepoPath ");
+
+            $repositoryVisibility = $entity->getVisibility()->getId();
+            if ($repositoryVisibility == 'public') {
+                //$chmod = '750';
+                $this->executeCommandAsGitUser("ln -s  $bareRepoPath $httpRepoSymLinkPath");
+            } else {
+                //$chmod = '700';
+            }
+
+
+            mkdir($tempRepoPath);
+            chmod($tempRepoPath, 0777);
+
+
+            $branchCreated = false;
+            /*
+             * initialize a temp git repository
+             */
+            $this->executeCommandAsGitUser("cd $tempRepoPath && git init");
+
+            /*
+             * add readme.md
+             */
+            if ($entity->getIsInitialize()) {
+                file_put_contents($tempRepoPath . 'README.md', $entity->getTitle());
+                chmod($tempRepoPath . 'README.md', 0777);
+                $this->executeCommandAsGitUser("cd $tempRepoPath  && git add --all && git commit -m 'Initial commit' ");
+
+                $branchCreated = true;
+            }
+
+
+            /*
+             * add .gitigonore
+             */
+            if ($entity->getFramework()) {
+                file_put_contents($tempRepoPath . '.gitignore', $entity->getFramework()->getGitignoreText());
+                chmod($tempRepoPath . '.gitignore', 0777);
+                $this->executeCommandAsGitUser("cd $tempRepoPath && git add --all && git commit -m 'gitignore added.'");
+
+                $branchCreated = true;
+            }
+
+            /*
+             * initialize git bare repository from temp repository and update server info
+             */
+            $this->executeCommandAsGitUser("git clone --bare $tempRepoPath $bareRepoPath && cd $bareRepoPath && git update-server-info");
+
+            /*
+             *  clone from bare repository.
+             */
+
+            $this->executeCommandAsGitUser("cd $oripRepoPath && git clone $bareRepoPath ");
+
+
+            /*
+             * Cleanup unnecessary files and optimize the local repository
+             */
+            $repoPath = $oripRepoPath . $entity->getPath() . '/';
+            $this->executeCommandAsGitUser("cd $repoPath && git gc > /dev/null 2>&1");
+
+
+            //update git braches count and repository update time.
+            if ($branchCreated == true) {
+                $repo = new GitRepository($tempRepoPath);
+                $status = $repo->getLog();
+                $branches = $repo->getBranches();
+                $entity->setCodeUpdatedAt($status[0]->getDatetimeCommitter());
+                $entity->setBranchesCount(count($branches));
+                $em->flush();
+            }
+
+            return $this->redirect($this->generateUrl('repository_permission', [
+                                'id' => $entity->getId(), 'projectId' => $projectId]));
+        }
+
+        //  echo $form->getErrorsAsString();
+
+        return $this->render('SourceBundle:Repository:new.html.twig', array(
+                    'entity' => $entity,
+                    'form' => $form->createView(),
+                    'projectId' => $projectId
+        ));
+    }
+
+//    /**
+//     * Finds and displays a Repository entity.
+//     *
+//     */
+//    public function showAction($id, $projectId) {
+//        $em = $this->getDoctrine()->getManager();
+//
+//        $entity = $em->getRepository('SourceBundle:Repository')->find($id);
+//
+//        if (!$entity) {
+//            throw $this->createNotFoundException('Unable to find Repository entity.');
+//        }
+//
+//        //  $repositoryPath = $this->container->getParameter('git_repository_path') . $id;
+//
+//
+//        $deleteForm = $this->createDeleteForm($id, $projectId);
+//
+//        return $this->render('SourceBundle:Repository:show.html.twig', array(
+//                    'entity' => $entity,
+//                    'delete_form' => $deleteForm->createView(),
+//                    'projectId' => $projectId,
+//                    'repo' => $repo,
+//        ));
+//    }
+
+    /**
+     * Finds and displays a Repository entity.
+     *
+     */
+    public function browseAction($id, $projectId, $treePath) {
+
+
+
+        $treePath = $treePath ? $treePath : 'master';
+
+        $em = $this->getDoctrine()->getManager();
+        $entity = $em->getRepository('SourceBundle:Repository')->find($id);
+
+        if (!$entity) {
+            throw $this->createNotFoundException('Unable to find Repository entity.');
+        }
+
+        $gitRepoPath = $this->container->getParameter('git_ori_repository_path') .
+                $entity->getProject()->getPath() . '/' . $entity->getPath();
+        $repo = new GitRepository($gitRepoPath);
+
+        $branches = $repo->getBranches();
+
+        $branchName = $this->findBranchFromTreePath($treePath, $branches);
+        //  $repo->checkout($branchName);
+
+        /*
+         * checkout branch
+         */
+        $this->executeCommandAsGitUser("cd $gitRepoPath && git checkout $branchName ");
+
+
+        $log = $repo->getLog($branchName);
+        $committers = [];
+        $gitUserEmail = $this->container->getParameter('git_user_email');
+        foreach ($log as $commit) {
+            if ($gitUserEmail != $commit->getCommitter()->getEmail()) {
+                $committers[$commit->getCommitter()->getEmail()] = $commit->getCommitter()->getName();
+            }
+        }
+
+        $isNode = ($treePath != $branchName) ? true : false;
+        if ($isNode) {
+            $path = substr($treePath, strlen($branchName) + 1);
+            $tree = $repo->getTree($branchName, $path);
+        } else {
+            $path = '';
+            $tree = $repo->getTree($branchName);
+        }
+
+        $repoSize = $this->getRepoSize($gitRepoPath);
+
+        return $this->render('SourceBundle:Repository:browse.html.twig', [
+                    'entity' => $entity,
+                    'projectId' => $projectId,
+                    'repo' => $repo,
+                    'gitRepoPath' => $gitRepoPath,
+                    'committers' => $committers,
+                    'tree' => $tree,
+                    'branch' => $branchName,
+                    'isNode' => $isNode,
+                    'nodePath' => $path,
+                    'treePath' => $treePath,
+                    'repoSize' => $repoSize]);
+    }
+
+    /*
+     * display file in repository
+     */
+
+    public function browseFileAction(Request $request, $projectId, $id, $treePath) {
+
+        $em = $this->getDoctrine()->getManager();
+
+        $entity = $em->getRepository('SourceBundle:Repository')->find($id);
+
+        if (!$entity) {
+            throw $this->createNotFoundException('Unable to find Repository entity.');
+        }
+        $gitRepoPath = $this->container->getParameter('git_ori_repository_path') .
+                $entity->getProject()->getPath() . '/' . $entity->getPath() . '/';
+        $repo = new GitRepository($gitRepoPath);
+
+        $branches = $repo->getBranches();
+        $branchName = $this->findBranchFromTreePath($treePath, $branches);
+
+
+        /*
+         * checkout branch
+         */
+        $this->executeCommandAsGitUser("cd $gitRepoPath && git checkout $branchName ");
+
+        $log = $repo->getLog($branchName);
+        $committers = [];
+        $gitUserEmail = $this->container->getParameter('git_user_email');
+        foreach ($log as $commit) {
+            if ($gitUserEmail != $commit->getCommitter()->getEmail()) {
+                $committers[$commit->getCommitter()->getEmail()] = $commit->getCommitter()->getName();
+            }
+        }
+
+        //echo 'branch ---='.$branchName;
+        $isNode = ($treePath != $branchName) ? true : false;
+        if ($isNode) {
+            $path = substr($treePath, strlen($branchName) + 1);
+            $tree = $repo->getTree($branchName, $path);
+        } else {
+            $path = '';
+            $tree = $repo->getTree($branchName);
+        }
+        //  var_dump($tree);
+        $filePath = $gitRepoPath . $path;
+
+        // echo 'file path='.$filePath;
+        $outputContent = shell_exec("pygmentize -f html -O style=colorful,linenos=1 $filePath");
+        if (!$outputContent) {
+            $outputContent = shell_exec("pygmentize -f html -O style=colorful,linenos=1 -l text $filePath");
+            //$outputContent = file_get_contents($filePath);
+        }
+
+        $numLines = count(file($filePath));
+
+        $repoSize = $this->getRepoSize($gitRepoPath);
+
+        return $this->render('SourceBundle:Repository:file.html.twig', [
+                    'entity' => $entity,
+                    'projectId' => $projectId,
+                    'path' => $path,
+                    'tree' => $tree,
+                    'log' => $log,
+                    'committers' => $committers,
+                    'gitRepoPath' => $gitRepoPath,
+                    'outputContent' => $outputContent,
+                    'numLines' => $numLines,
+                    'branch' => $branchName,
+                    'nodePath' => $path,
+                    'repoSize' => $repoSize,
+        ]);
+    }
+
+    public function downloadTreeAction(Request $request, $projectId, $id, $branch) {
+
+        $type = $request->query->get('type');
+
+        if (!array_search($type, ['zip', 'tar', 'tar.bz', 'tar.gz'])) {
+            $type = 'zip';
+        }
+
+        switch ($type) {
+            case 'tar.gz':
+                $firstEncodingType = 'tar';
+                $contentType = 'application/tar.gz';
+                break;
+//            case 'tar.bz2':
+//                $firstEncodingType = 'tar';
+//                $contentType = 'application/tar.bz2';
+//                break;
+            case 'tar':
+                $firstEncodingType = 'tar';
+                $contentType = 'application/tar';
+                break;
+            case 'zip':
+            default:
+                $firstEncodingType = 'zip';
+                $contentType = 'application/zip';
+                break;
+        }
+
+        $em = $this->getDoctrine()->getManager();
+        $entity = $em->getRepository('SourceBundle:Repository')->find($id);
+
+        if (!$entity) {
+            throw $this->createNotFoundException('Unable to find Repository entity.');
+        }
+        $gitRepoPath = $this->container->getParameter('git_ori_repository_path') .
+                $entity->getProject()->getPath() . '/' . $entity->getPath() . '/';
+
+        $repo = new GitRepository($gitRepoPath);
+
+        $log = $repo->getLog($branch);
+        $sha = $log[0]->getSha();
+
+//        $output = shell_exec("cd $gitRepoPath && git archive --format=$firstEncodingType  $sha");
+//
+//        if ($type == 'tar.gz') {
+//            $output = zlib_encode($output, ZLIB_ENCODING_GZIP);
+//        }
+
+        $response = new StreamedResponse(function() use($gitRepoPath, $firstEncodingType, $sha, $type) {
+            $handle = popen("cd $gitRepoPath && git archive --format=$firstEncodingType  $sha", 'r');
+
+
+            while (!feof($handle)) {
+                $buffer = fread($handle, 65535);
+                if ($type == 'tar.gz') {
+                    $buffer = zlib_encode($buffer, ZLIB_ENCODING_GZIP);
+                }
+                echo $buffer;
+                flush();
+            }
+            pclose($handle);
+        });
+
+        //$response = new Response($output);
+        $response->headers->set('Content-Type', $contentType);
+        $response->headers->set('Content-Disposition', "attachment; filename={$entity->getPath()}_$branch.$type");
+        return $response;
+    }
+
+    /**
+     * Displays a form to edit an existing Repository entity.
+     *
+     */
+    public function editAction($id, $projectId) {
+        $em = $this->getDoctrine()->getManager();
+
+        $entity = $em->getRepository('SourceBundle:Repository')->find($id);
+
+        if (!$entity) {
+            throw $this->createNotFoundException('Unable to find Repository entity.');
+        }
+
+        $editForm = $this->createEditForm($entity, $projectId);
+        $deleteForm = $this->createDeleteForm($id, $projectId);
+
+        return $this->render('SourceBundle:Repository:edit.html.twig', array(
+                    'entity' => $entity,
+                    'edit_form' => $editForm->createView(),
+                    'delete_form' => $deleteForm->createView(),
+                    'projectId' => $projectId
+        ));
+    }
+
+    /**
+     * Edits an existing Repository entity.
+     *
+     */
+    public function updateAction(Request $request, $id, $projectId) {
+        $em = $this->getDoctrine()->getManager();
+
+        $entity = $em->getRepository('SourceBundle:Repository')->find($id);
+
+        if (!$entity) {
+            throw $this->createNotFoundException('Unable to find Repository entity.');
+        }
+
+        $deleteForm = $this->createDeleteForm($id, $projectId);
+        $editForm = $this->createEditForm($entity);
+        $editForm->handleRequest($request);
+
+        if ($editForm->isValid()) {
+            $em->flush();
+
+            return $this->redirect($this->generateUrl('repository_edit', array('id' => $id)));
+        }
+
+        return $this->render('SourceBundle:Repository:edit.html.twig', array(
+                    'entity' => $entity,
+                    'edit_form' => $editForm->createView(),
+                    'delete_form' => $deleteForm->createView(),
+        ));
+    }
+
+    /**
+     * Deletes a Repository entity.
+     *
+     */
+    public function deleteAction(Request $request, $id, $projectId) {
+        $form = $this->createDeleteForm($id, $projectId);
+        $form->handleRequest($request);
+
+        if ($form->isValid()) {
+            $em = $this->getDoctrine()->getManager();
+            $entity = $em->getRepository('SourceBundle:Repository')->find($id);
+
+            if (!$entity) {
+                throw $this->createNotFoundException('Unable to find Repository entity.');
+            }
+
+            $em->remove($entity);
+            $em->flush();
+        }
+
+        return $this->redirect($this->generateUrl('repository', ['projectId' => $projectId]));
+    }
+
+    /**
+     * Creates a form to create a Repository entity.
+     *
+     * @param Repository $entity The entity
+     *
+     * @return \Symfony\Component\Form\Form The form
+     */
+    private function createCreateForm(Repository $entity, $projectId) {
+        $form = $this->createForm(new RepositoryType(), $entity, array(
+            'action' => $this->generateUrl('repository_create', ['projectId' => $projectId]),
+            'method' => 'POST',
+        ));
+        // $form->add('submit', 'submit', array('label' => 'Create'));
+
+        return $form;
+    }
+
+    /**
+     * Creates a form to edit a Repository entity.
+     *
+     * @param Repository $entity The entity
+     *
+     * @return \Symfony\Component\Form\Form The form
+     */
+    private function createEditForm(Repository $entity, $projectId) {
+        $form = $this->createForm(new RepositoryType(), $entity, array(
+            'action' => $this->generateUrl('repository_update', array('id' => $entity->getId(), 'projectId' => $projectId)),
+            'method' => 'PUT',
+        ));
+
+        $form->add('submit', 'submit', array('label' => 'Update'));
+
+        return $form;
+    }
+
+    /**
+     * Creates a form to delete a Repository entity by id.
+     *
+     * @param mixed $id The entity id
+     *
+     * @return \Symfony\Component\Form\Form The form
+     */
+    private function createDeleteForm($id, $projectId) {
+        return $this->createFormBuilder()
+                        ->setAction($this->generateUrl('repository_delete', array('id' => $id, 'projectId' => $projectId)))
+                        ->setMethod('DELETE')
+                        ->add('submit', 'submit', array('label' => 'Delete'))
+                        ->getForm()
+        ;
+    }
+
+    private function findBranchFromTreePath($treePath, $branches) {
+
+        $branchName = 'master';
+        foreach ($branches as $branch) {
+            $name = $branch->getName();
+            if (strpos($treePath, $name) === 0) {
+                $branchName = $name;
+            }
+        }
+
+        return $branchName;
+    }
+
+    private function executeCommandAsGitUser($command) {
+
+        $gitUserName = $this->container->getParameter('git_user_name');
+        $gitUserPassword = $this->container->getParameter('git_user_password');
+        $trusrcHost = $this->container->getParameter('trusrc_host');
+
+        $connection = ssh2_connect($trusrcHost);
+        ssh2_auth_password($connection, $gitUserName, $gitUserPassword);
+
+        /*
+         * execute command as git user
+         */
+
+        $stream = ssh2_exec($connection, "$command ");
+        /*
+         * to wait until ssh2_exec finish. (do not remove this)
+         */
+        stream_set_blocking($stream, true);
+        $stream_out = ssh2_fetch_stream($stream, SSH2_STREAM_STDIO);
+        $content = stream_get_contents($stream_out);
+
+
+        //    echo $content;
+    }
+
+    private function getRepoSize($repoPath) {
+        $output = shell_exec("cd $repoPath  &&  git count-objects -v ");
+        $output = explode("\n", $output);
+        $output = explode('size-pack: ', $output[4]);
+        return $output[1];
+    }
+
+}
